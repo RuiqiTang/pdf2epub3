@@ -1,0 +1,5 @@
+streamlit
+pdfminer.six
+ebooklib
+pillow
+pdf2image
