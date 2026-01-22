@@ -51,10 +51,7 @@ class EPUBBuilder:
             "</html>"
         )
 
-        # 🚨 最后一道保险：字符串级校验
-        if not xhtml.strip():
-            return
-
+        # 创建章节并添加到书籍和章节列表
         chapter = epub.EpubHtml(
             title=f"Page {page.page_number}",
             file_name=f"page_{page.page_number}.xhtml",
@@ -65,18 +62,13 @@ class EPUBBuilder:
         self._chapters.append(chapter)
 
     def build(self, output_path: Path) -> None:
-        # 🚨 再次过滤：防止任何空章节进入 book
-        valid_chapters = []
-        for ch in self._chapters:
-            content = ch.get_content()
-            if content and content.strip():
-                valid_chapters.append(ch)
+        # 确保至少有一个章节
+        if not self._chapters:
+            raise RuntimeError("No chapters added to EPUB")
 
-        if not valid_chapters:
-            raise RuntimeError("No valid EPUB chapters generated")
-
-        self._book.toc = valid_chapters
-        self._book.spine = ["nav"] + valid_chapters
+        # 使用所有已添加的章节
+        self._book.toc = self._chapters
+        self._book.spine = ["nav"] + self._chapters
 
         self._book.add_item(epub.EpubNcx())
         self._book.add_item(epub.EpubNav())
