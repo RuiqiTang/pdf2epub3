@@ -1,5 +1,8 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
 <head>
     <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
     <title>EPUB Preview</title>
 
     <!-- 本地 epub.js，避免 CDN / CSP / iframe 问题 -->
@@ -10,13 +13,168 @@
             width: 100%;
             height: 100%;
             margin: 0;
+            padding: 0;
             background: #f5f5f5;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
         }
 
         #viewer {
             width: 100%;
             height: 100%;
             background: white;
+            border: none;
+        }
+
+        #loading {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100%;
+            flex-direction: column;
+            color: #666;
+        }
+
+        #error {
+            display: none;
+            padding: 20px;
+            color: #d32f2f;
+            background: #ffebee;
+            border: 1px solid #ffcdd2;
+            border-radius: 4px;
+            margin: 20px;
+        }
+
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin-bottom: 20px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
         }
     </style>
 </head>
+<body>
+    <div id="loading">
+        <div class="spinner"></div>
+        <div>正在加载 EPUB...</div>
+    </div>
+    <div id="error"></div>
+    <div id="viewer"></div>
+
+    <script>
+        (function() {
+            // 从 URL 参数获取 EPUB 文件路径
+            const urlParams = new URLSearchParams(window.location.search);
+            const epubPath = urlParams.get('epub') || '/preview/output.epub';
+            
+            // 构建完整的 EPUB URL
+            const epubUrl = epubPath.startsWith('http') ? epubPath : window.location.origin + epubPath;
+            
+            console.log('Loading EPUB from:', epubUrl);
+            
+            // 检查 epub.js 是否已加载
+            if (typeof ePub === 'undefined') {
+                showError('EPUB.js 库未加载，请检查 epub.min.js 文件是否存在');
+                return;
+            }
+            
+            // 显示加载状态
+            const loadingEl = document.getElementById('loading');
+            const loadingText = loadingEl.querySelector('div:last-child');
+            const errorEl = document.getElementById('error');
+            
+            // 设置超时（30秒）
+            const timeout = setTimeout(function() {
+                loadingEl.style.display = 'none';
+                showError('加载超时，请检查 EPUB 文件是否有效');
+            }, 30000);
+            
+            // 更新加载提示
+            function updateLoadingText(text) {
+                if (loadingText) {
+                    loadingText.textContent = text;
+                }
+            }
+            
+            // 创建 EPUB 阅读器
+            updateLoadingText('正在初始化 EPUB 阅读器...');
+            const book = ePub(epubUrl, {
+                openAs: 'epub'
+            });
+            
+            // 等待 EPUB 准备就绪
+            book.ready.then(function() {
+                console.log('EPUB book ready');
+                updateLoadingText('正在渲染内容...');
+                
+                const viewer = document.getElementById('viewer');
+                const rendition = book.renderTo(viewer, {
+                    width: '100%',
+                    height: '100%',
+                    spread: 'none',
+                    flow: 'paginated'
+                });
+                
+                // 加载第一页
+                rendition.display()
+                    .then(function() {
+                        console.log('EPUB rendered successfully');
+                        clearTimeout(timeout);
+                        loadingEl.style.display = 'none';
+                    })
+                    .catch(function(error) {
+                        console.error('Error rendering EPUB:', error);
+                        clearTimeout(timeout);
+                        loadingEl.style.display = 'none';
+                        showError('渲染 EPUB 失败: ' + (error.message || error));
+                    });
+                
+                // 键盘导航
+                rendition.on('keyup', function(e) {
+                    if (e.key === 'ArrowRight') {
+                        book.package.metadata.direction === 'rtl' ? rendition.prev() : rendition.next();
+                    }
+                    if (e.key === 'ArrowLeft') {
+                        book.package.metadata.direction === 'rtl' ? rendition.next() : rendition.prev();
+                    }
+                });
+                
+                // 点击导航
+                viewer.addEventListener('click', function(e) {
+                    const width = viewer.clientWidth;
+                    const x = e.clientX;
+                    
+                    if (x < width / 2) {
+                        book.package.metadata.direction === 'rtl' ? rendition.next() : rendition.prev();
+                    } else {
+                        book.package.metadata.direction === 'rtl' ? rendition.prev() : rendition.next();
+                    }
+                });
+                
+                // 处理窗口大小变化
+                window.addEventListener('resize', function() {
+                    rendition.resize();
+                });
+            }).catch(function(error) {
+                console.error('Error loading EPUB:', error);
+                clearTimeout(timeout);
+                loadingEl.style.display = 'none';
+                showError('加载 EPUB 失败: ' + (error.message || error));
+            });
+            
+            // 显示错误信息
+            function showError(message) {
+                errorEl.textContent = message;
+                errorEl.style.display = 'block';
+            }
+        })();
+    </script>
+</body>
+</html>

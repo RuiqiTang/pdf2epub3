@@ -1,11 +1,18 @@
 # ui/app.py
 import os
+import sys
 import tempfile
 import threading
+import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
 import mimetypes
+
+# 添加项目根目录到 Python 路径
+_project_root = Path(__file__).parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
 
 import streamlit as st
 
@@ -163,24 +170,70 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
 
 
 class StreamlitProgress(ProgressCallback):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        html_path: Optional[Path] = None,
+        preview_placeholder: Optional["st.delta_generator.DeltaGenerator"] = None,
+    ) -> None:
         self._progress_bar = st.progress(0.0)
         self._status = st.empty()
         self._total = 0
+        self._html_path = html_path
+        self._preview_placeholder = preview_placeholder
+
+    def _render_streaming_preview(self) -> None:
+        """在转换过程中实时预览（HTML 文件可能尚未写入 footer，所以要补齐关闭标签）。"""
+        if self._html_path is None or self._preview_placeholder is None:
+            return
+        if not self._html_path.exists():
+            return
+
+        try:
+            content = self._html_path.read_text(encoding="utf-8")
+        except Exception:
+            return
+
+        # HTML 可能还没写 footer：补齐以便浏览器/Streamlit 能渲染
+        if "</html>" not in content:
+            content += "\n    </div>\n  </div>\n</body>\n</html>\n"
+
+        # 提取样式与 body 内容（避免把整份 <html> 嵌进 Streamlit）
+        import re
+
+        style_match = re.search(r"<style>(.*?)</style>", content, re.DOTALL | re.IGNORECASE)
+        styles = style_match.group(1) if style_match else ""
+
+        body_match = re.search(r"<body[^>]*>(.*?)</body>", content, re.DOTALL | re.IGNORECASE)
+        body_content = body_match.group(1) if body_match else content
+
+        final_html = f"<style>{styles}</style>{body_content}"
+        self._preview_placeholder.markdown(final_html, unsafe_allow_html=True)
+    
+    def render_preview(self) -> None:
+        """公开方法：立即更新预览（供外部调用）"""
+        self._render_streaming_preview()
 
     def on_start(self, total_pages: int) -> None:
         self._total = total_pages
         self._status.info(f"开始处理 PDF，共 {total_pages} 页")
+        if self._preview_placeholder is not None:
+            self._preview_placeholder.info("实时预览将在第 1 页生成后显示…")
 
     def on_page_processed(self, page_number: int) -> None:
         self._progress_bar.progress(page_number / self._total)
         self._status.info(
             f"正在处理第 {page_number} / {self._total} 页"
         )
+        # 每页处理完就刷新一次预览
+        self._render_streaming_preview()
 
     def on_finish(self, output_path: str) -> None:
         self._progress_bar.progress(1.0)
-        self._status.success("EPUB3 转换完成")
+        self._status.success("HTML 转换完成")
+    
+    def update(self, message: str) -> None:
+        """更新进度消息"""
+        self._status.info(message)
 
 
 def _start_static_server(static_root: Path) -> Optional[int]:
@@ -254,6 +307,52 @@ def _start_static_server(static_root: Path) -> Optional[int]:
     return _SERVER_PORT
 
 
+def render_html_preview(html_path: Path, work_dir: Path) -> None:
+    """直接显示HTML预览 - 不使用iframe，直接嵌入到页面中"""
+    try:
+        # 直接读取HTML内容
+        html_content = html_path.read_text(encoding='utf-8')
+        
+        st.subheader("HTML 在线预览")
+        
+        # 提取 body 标签内的内容，直接显示在 Streamlit 页面中
+        import re
+        body_match = re.search(r'<body[^>]*>(.*?)</body>', html_content, re.DOTALL | re.IGNORECASE)
+        style_match = re.search(r'<style[^>]*>(.*?)</style>', html_content, re.DOTALL | re.IGNORECASE)
+        
+        if body_match and style_match:
+            # 提取样式和内容
+            style_content = style_match.group(1)
+            body_content = body_match.group(1)
+            
+            # 将样式和内容组合，直接嵌入到页面中
+            combined_html = f"""
+            <style>
+            {style_content}
+            </style>
+            {body_content}
+            """
+            
+            # 使用 st.markdown 直接显示，不使用 iframe
+            st.markdown(combined_html, unsafe_allow_html=True)
+        else:
+            # 如果无法提取，直接显示整个HTML（去掉html和body标签）
+            # 移除 DOCTYPE, html, head, body 标签，只保留内容
+            content = re.sub(r'<!DOCTYPE[^>]*>', '', html_content, flags=re.IGNORECASE)
+            content = re.sub(r'<html[^>]*>', '', content, flags=re.IGNORECASE)
+            content = re.sub(r'</html>', '', content, flags=re.IGNORECASE)
+            content = re.sub(r'<head[^>]*>.*?</head>', '', content, flags=re.DOTALL | re.IGNORECASE)
+            content = re.sub(r'<body[^>]*>', '', content, flags=re.IGNORECASE)
+            content = re.sub(r'</body>', '', content, flags=re.IGNORECASE)
+            
+            st.markdown(content, unsafe_allow_html=True)
+            
+    except Exception as e:
+        st.error(f"无法显示HTML预览: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+
+
 def render_epub_preview(epub_path: Path, work_dir: Path) -> None:
     static_root = work_dir / "static"
     preview_dir = static_root / "preview"
@@ -267,9 +366,8 @@ def render_epub_preview(epub_path: Path, work_dir: Path) -> None:
         st.error(f"viewer assets not found at {viewer_src}")
         return
 
-    print(f"[COPY] Starting to copy viewer assets from {viewer_src}", flush=True)
+    # 快速复制 viewer 资源（只在文件不存在时复制）
     for p in viewer_src.rglob("*"):
-        # Skip hidden files
         if p.name.startswith("."):
             continue
 
@@ -278,25 +376,21 @@ def render_epub_preview(epub_path: Path, work_dir: Path) -> None:
         if p.is_dir():
             target.mkdir(parents=True, exist_ok=True)
         else:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(p.read_bytes())
+            # 只在目标文件不存在或源文件更新时才复制
+            if not target.exists() or target.stat().st_mtime < p.stat().st_mtime:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(p.read_bytes())
 
-    # 放 epub 到同一目录
+    # 快速复制 EPUB 文件
     try:
-        print(f"[COPY] Writing EPUB to {preview_dir / 'output.epub'}", flush=True)
         epub_bytes = epub_path.read_bytes()
-        print(f"[COPY] EPUB file size: {len(epub_bytes)} bytes", flush=True)
-        (preview_dir / "output.epub").write_bytes(epub_bytes)
-        print(f"[COPY] EPUB written, exists now: {(preview_dir / 'output.epub').exists()}", flush=True)
+        epub_target = preview_dir / "output.epub"
+        # 只在文件不存在或源文件更新时才复制
+        if not epub_target.exists() or epub_target.stat().st_mtime < epub_path.stat().st_mtime:
+            epub_target.write_bytes(epub_bytes)
     except FileNotFoundError:
         st.error("转换后 EPUB 文件未找到")
         return
-
-    # Verify all files exist before starting server
-    print(f"[VERIFY] Checking files exist in {preview_dir}:", flush=True)
-    for f in preview_dir.rglob("*"):
-        if f.is_file():
-            print(f"  ✓ {f.relative_to(preview_dir)}", flush=True)
 
     port = _start_static_server(static_root)
 
@@ -322,11 +416,11 @@ def main() -> None:
     global _TEMP_DIR
     
     st.set_page_config(
-        page_title="PDF → EPUB3",
+        page_title="PDF → HTML",
         layout="centered",
     )
 
-    st.title("PDF 转 EPUB3（含数学公式）")
+    st.title("PDF 转 HTML（含数学公式）")
 
     uploaded_file = st.file_uploader(
         "上传 PDF 文件",
@@ -345,30 +439,106 @@ def main() -> None:
     work_dir = Path(tmpdir)
 
     pdf_path = work_dir / uploaded_file.name
-    epub_path = work_dir / "output.epub"
+    html_path = work_dir / "output.html"
 
     pdf_path.write_bytes(uploaded_file.read())
 
-    if st.button("开始转换"):
-        progress = StreamlitProgress()
-
-        pipeline = PDFToEPUBPipeline(
-            pdf_path=pdf_path,
-            output_path=epub_path,
-            progress_callback=progress,
+    # OCR选项
+    st.sidebar.header("OCR 选项")
+    
+    # 检查 poppler 是否可用
+    poppler_available = False
+    try:
+        result = subprocess.run(
+            ['pdftoppm', '-v'],
+            capture_output=True,
+            timeout=2
         )
-        pipeline.run()
+        poppler_available = True
+    except (FileNotFoundError, subprocess.TimeoutExpired, ImportError):
+        poppler_available = False
+    
+    if not poppler_available:
+        st.sidebar.warning(
+            "⚠️ OCR 功能需要安装 poppler\n\n"
+            "**macOS:**\n"
+            "```bash\nbrew install poppler\n```\n\n"
+            "**Linux:**\n"
+            "```bash\nsudo apt-get install poppler-utils\n```\n\n"
+            "**Windows:**\n"
+            "下载 poppler 并添加到 PATH"
+        )
+    
+    use_ocr = st.sidebar.checkbox(
+        "启用 OCR（用于扫描版PDF）",
+        value=False,
+        disabled=not poppler_available,
+        help="如果PDF是扫描版或文本提取效果差，可以启用OCR" if poppler_available else "需要先安装 poppler"
+    )
+    
+    if use_ocr:
+        ocr_backend = st.sidebar.selectbox(
+            "OCR 引擎",
+            options=["paddleocr", "easyocr", "tesseract"],
+            index=0,
+            help="PaddleOCR: 推荐，支持中文和数学公式\nEasyOCR: 多语言支持\nTesseract: 传统OCR引擎"
+        )
+    else:
+        ocr_backend = "paddleocr"
+
+    if st.button("开始转换"):
+        st.subheader("HTML 在线预览（实时）")
+        preview_placeholder = st.empty()
+
+        progress = StreamlitProgress(
+            html_path=html_path,
+            preview_placeholder=preview_placeholder,
+        )
+        
+        # 如果启用 OCR，显示初始化提示
+        if use_ocr:
+            st.info("ℹ️ **提示**: PaddleOCR 首次初始化可能需要几分钟时间，请耐心等待。模型加载完成后会显示进度。")
+
+        try:
+            pipeline = PDFToEPUBPipeline(
+                pdf_path=pdf_path,
+                output_path=html_path,
+                progress_callback=progress,
+                output_format="html",  # 使用HTML格式
+                use_ocr=use_ocr,
+                ocr_backend=ocr_backend,
+            )
+            pipeline.run()
+        except RuntimeError as e:
+            error_msg = str(e)
+            if "poppler" in error_msg.lower():
+                st.error(f"❌ {error_msg}")
+                st.info(
+                    "**安装 poppler 后，请重启 Streamlit 应用。**\n\n"
+                    "重启命令：停止当前应用（Ctrl+C），然后重新运行：\n"
+                    "```bash\nstreamlit run ui/app.py\n```"
+                )
+            else:
+                st.error(f"转换失败: {error_msg}")
+            return
+        except Exception as e:
+            st.error(f"转换失败: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+            return
 
         st.success("转换完成")
 
+        # 下载按钮
         st.download_button(
-            label="下载 EPUB3",
-            data=epub_path.read_bytes(),
-            file_name="output.epub",
-            mime="application/epub+zip",
+            label="下载 HTML",
+            data=html_path.read_bytes(),
+            file_name="output.html",
+            mime="text/html",
         )
 
-        render_epub_preview(epub_path, work_dir)
+        # 直接显示HTML预览
+        render_html_preview(html_path, work_dir)
 
 
 if __name__ == "__main__":

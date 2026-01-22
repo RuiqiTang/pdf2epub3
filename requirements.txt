@@ -3,3 +3,7 @@ pdfminer.six
 ebooklib
 pillow
 pdf2image
+paddlepaddle>=2.5.0
+paddleocr>=2.7.0
+numpy
+lxml
